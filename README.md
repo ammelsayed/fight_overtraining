@@ -176,6 +176,137 @@ For every channel, every direction (DF1→DF2 and DF2→DF1) and every configura
 10. L. Kish, *Survey Sampling*, Wiley (1965) — the effective sample size used in §2.2 and §3.1
 11. ATLAS Collaboration, *Fiducial and differential cross-sections for VBF H→WW\*→eνμν*, Phys. Rev. D 108 (2023) 072003, [arXiv:2304.03053](https://arxiv.org/abs/2304.03053) — example of the KS train/test overtraining check
 
-## 6. Status
+## 6. Results
 
-Results and findings will be added here after the study.
+All numbers are averages over the two directions (DF1→DF2 and DF2→DF1). The overtraining check is
+run on the M = 1000 GeV hypothesis only. `gap` is the train − test AUC on that slice; a negative gap
+means the test sample is *better* than the training sample, i.e. pure statistical fluctuation.
+
+### 6.1 The defaults do not overtrain in two channels — they cannot train at all
+
+| channel | mode | slice AUC train → test | gap | KS *p* (sig / bkg) | χ² *p* (sig / bkg) | test AUC (all) |
+|---|---|---|---|---|---|---|
+| `3L_eee` | baseline | 0.979 → 0.966 | +0.013 | 0.12 / 0.12 | 0.22 / 0.42 | 0.976 |
+| `3L_eeeJ` | baseline | **0.500 → 0.500** | 0.000 | 0 / 0 | 0 / 0 | **0.500** |
+| `4L_eeee` | baseline | **0.500 → 0.500** | 0.000 | 0 / 0 | 0 / 0 | **0.500** |
+
+Two of the three channels produce a **constant classifier**. The reason is §2.1: `min_child_weight
+= 1` is an absolute hessian threshold, while the whole balanced training sample is worth 1.65
+(`3L_eeeJ`) and 0.25 (`4L_eeee`) hessian units. No split is ever accepted. This is the single most
+important finding of the study — the apparent "per-channel hyper-parameter problem" is one
+dimensional-analysis bug, not three different physics problems.
+
+### 6.2 Data-driven regularization
+
+`reg` = the full derived set (§3.1, §3.2) with the physical weights kept.
+
+| channel | mode | slice AUC train → test | gap | KS *p* (sig / bkg) | test AUC (all) | trees |
+|---|---|---|---|---|---|---|
+| `3L_eee` | reg | 0.991 → 0.975 | +0.016 | 0.35 / 0.007 | 0.985 | 150 |
+| `3L_eeeJ` | reg | 0.983 → 0.932 | +0.051 | 0.48 / 0.25 | 0.951 | 55 |
+| `4L_eeee` | reg | 0.983 → 0.906 | +0.077 | 0.27 / 0.09 | 0.938 | 372 |
+
+The two dead channels are resurrected: test AUC 0.500 → 0.951 and 0.500 → 0.938. The derived
+parameters are:
+
+| channel | `min_child_weight` | `max_depth` | `reg_lambda` | `subsample` | `colsample_bytree` | eff. rank |
+|---|---|---|---|---|---|---|
+| `3L_eee` | 0.127 | 6 | 0.127 | 0.595 | 0.317 | 6.0 / 18 |
+| `3L_eeeJ` | 0.103 | 4 | 0.353 | 0.617 | 0.280 | 8.7 / 30 |
+| `4L_eeee` | 0.0155 | 4 | 0.275 | 0.521 | 0.324 | 6.5 / 19 |
+
+Note that `min_child_weight` is *three orders of magnitude* away from the XGBoost default, and that
+it tracks the available statistics rather than the channel identity.
+
+### 6.3 Over-sampling
+
+| channel | mode | slice AUC train → test | gap | KS *p* (sig / bkg) | test AUC (all) |
+|---|---|---|---|---|---|
+| `3L_eee` | flat_smote | 0.994 → 0.978 | +0.017 | 0.44 / 0.0005 | **0.988** |
+| `3L_eeeJ` | flat_smote | 0.990 → 0.955 | +0.035 | 0.72 / 0.16 | **0.970** |
+| `4L_eeee` | flat_bagging | 0.969 → 0.927 | +0.042 | 0.37 / 0.076 | **0.961** |
+
+Over-sampling helps in the two low-statistics channels and is neutral in the high-statistics one:
+
+| channel | no oversampling (`reg_flatten`) | + bagging | + SMOTE |
+|---|---|---|---|
+| `3L_eee` | 0.9873 | 0.9866 | 0.9881 |
+| `3L_eeeJ` | 0.9692 | 0.9682 | 0.9698 |
+| `4L_eeee` | 0.9608 | 0.9614 | 0.9614 |
+
+(test AUC, all masses). The gain is small and, in `3L_eee`, within the run-to-run spread — the honest
+conclusion is that **over-sampling does not beat regularization here**. It is a second-order effect
+once the leaf floor is expressed in the right units.
+
+### 6.4 Background weight treatment — the decisive change
+
+Three treatments were compared with everything else held at the derived values:
+
+| channel | keep physical weights | **flatten per process** | clip at 99.9% |
+|---|---|---|---|
+| `3L_eee` | 0.9852 | **0.9873** | 0.9852 |
+| `3L_eeeJ` | 0.9511 | **0.9692** | 0.9511 |
+| `4L_eeee` | 0.9376 | **0.9608** | 0.9376 |
+
+(test AUC, all masses). Flattening wins on all three channels and is the single largest improvement
+after the units fix — +0.018 in `3L_eeeJ`, +0.023 in `4L_eeee`.
+
+**Clipping is a no-op, and this is a bug worth recording.** The 99.9% quantile of the background
+weight is *exactly* the `VVV` weight (0.02327) in all three channels, because `VVV` is only
+0.8–1.7% of the events. Clipping at that quantile therefore removes nothing, and the `reg_clip` rows
+are bit-identical to `reg`. A quantile-based clip cannot see a small, heavy-tailed process; it must
+be defined per process, not on the pooled distribution. The arm is kept in the table to document the
+failure rather than deleted.
+
+### 6.5 What the residual gap actually is
+
+The remaining train/test gaps (+0.02 to +0.08) are **not** memorization. Two pieces of evidence:
+
+1. **They are not reproducible in direction.** In `4L_eeee` the gap is +0.13 for DF1→DF2 and
+   **−0.047** for DF2→DF1: the held-out sample scores *better* than the training sample. A model that
+   memorizes cannot do that. The same sign flip appears for `reg`, `reg_flatten` and `flat_smote`.
+2. **They are driven by a handful of events.** In `4L_eeee` the background is 189 unique events, of
+   which the top 5 carry **80–85% of the total background weight** (one `VVV` event alone is 28–39%).
+   The χ² test on that channel is therefore a test on ~3 effective events, and its *p*-value is
+   meaningless. Excluding the top-1% weight test events leaves the KS distance essentially unchanged
+   (D = 0.045 → 0.041), confirming the tension is in the bulk, not in outliers.
+
+The gap correlates with the available statistics rather than with the method:
+
+| statistic | Pearson *r* vs gap | *p* |
+|---|---|---|
+| N_eff(background) | −0.32 | 0.012 |
+| log₁₀ N_eff(background) | −0.40 | 0.0018 |
+
+So the correct statement is not "method X overtrains" but "**4L_eeee has three effective background
+events**", and no regularization can manufacture statistics that are not in the sample.
+
+### 6.6 The recommended configuration
+
+`reg_flatten` / `flat_bagging` / `flat_smote` are within 0.001–0.002 of each other in test AUC.
+The simplest configuration that achieves the result is **`reg_flatten`: data-driven regularization
+with per-process weight flattening and no over-sampling**, because it needs one fewer moving part
+and its gap is no worse. Over-sampling is retained as an option (`oversample="bagging"|"smote"`) and
+gives a marginal gain in `3L_eee`.
+
+Summary of the winning configuration across the three channels:
+
+| channel | slice AUC train → test | gap | KS *p* (sig / bkg) | test AUC (all) |
+|---|---|---|---|---|
+| `3L_eee` | 0.992 → 0.976 | +0.016 | 0.40 / 0.050 | 0.9873 |
+| `3L_eeeJ` | 0.990 → 0.951 | +0.039 | 0.72 / 0.29 | 0.9692 |
+| `4L_eeee` | 0.972 → 0.927 | +0.045 | 0.37 / 0.077 | 0.9608 |
+
+### 6.7 Caveats
+
+- The `4L_eeee` χ² *p*-values are not trustworthy: with 3 effective background events the test has no
+  power. The KS distance is the more honest diagnostic there.
+- `3L_eee` is the only channel where the defaults train at all, so it is the only place where the
+  "beats overtraining" claim can be tested against a working baseline. There, the derived
+  regularization does **not** shrink the gap (0.013 → 0.016) but raises the test AUC (0.976 → 0.987);
+  the baseline's small gap was luck, not virtue.
+- No channel shows a significant KS discrepancy in the derived configurations, which is the
+  operational definition of "no overtraining" used here.
+- Everything above is a single random seed per configuration. The spread between the two directions
+  (±0.05 in `4L_eeee`) is larger than most of the differences between methods, which is why the
+  conclusions are stated as rankings rather than as precise numbers.

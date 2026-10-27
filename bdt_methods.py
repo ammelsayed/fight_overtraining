@@ -81,6 +81,26 @@ def get_weights_info(w):
     if len(w) == 0: return "empty"
     else: return f"total={np.sum(w):.6e}, min={np.min(w):.6e}, max={np.max(w):.6e}, mean={np.mean(w):.6e}, std={np.std(w):.6e}"
 
+def effective_weight(w):
+    """
+    Kish effective weight of a weighted sample, w_eff = sum(w^2) / sum(w).
+
+    With equal weights this reduces to the mean weight; with heterogeneous weights it is larger
+    than the mean and equals the weight of an event in the equivalent equal-weight sample of size
+    N_eff = (sum w)^2 / sum(w^2). This is the currency in which the XGBoost structural parameters
+    (min_child_weight, reg_lambda) must be expressed, because those parameters are thresholds on
+    the *hessian*, and the hessian of an event is proportional to its weight.
+    """
+    w = np.asarray(w, dtype=np.float64)
+    s = w.sum()
+    return float((w ** 2).sum() / s) if s > 0 else 0.0
+
+def effective_events(w):
+    """Kish effective number of events, N_eff = (sum w)^2 / sum(w^2)."""
+    w = np.asarray(w, dtype=np.float64)
+    s2 = (w ** 2).sum()
+    return float(w.sum() ** 2 / s2) if s2 > 0 else 0.0
+
 def to_Xyw(df_sig, df_bkg, features, weight_col = "weight"):
     X_sig = df_sig[features].values.astype(np.float32)
     X_bkg = df_bkg[features].values.astype(np.float32)
@@ -154,7 +174,78 @@ def reweight_to_uniform_distributions(df, group_col="proc_name", weight_col="fla
     df_uniform = pd.concat(parts, ignore_index=True)
     return df_uniform
 
-def df_train_val_split(df_sig, df_bkg, features, train_size=0.80, weight_col = "flat_weight"):
+def oversample_bagging(df, group_col="signal_mass", weight_col="flat_weight", random_state=42):
+    """
+    Over-sampling by bagging: resampling *with replacement*, within each truth-mass hypothesis.
+
+    This is the resampling method documented for BDT training in HEP: TMVA's bagging variant
+    resamples the training sample stochastically with replacement. Applied here to the minority
+    (signal) class only, and per mass hypothesis, so the added content is always a resample of real
+    events and never an interpolation that could produce unphysical kinematics.
+
+    A row drawn k times carries weight w/k, so the total weight of the sample - and hence the
+    physics normalization - is unchanged.
+    """
+    rng = np.random.RandomState(random_state)
+    parts = []
+    for key, group in df.groupby(group_col):
+        n = len(group)
+        if n < 2:
+            parts.append(group)
+            continue
+        idx = rng.choice(n, size=n, replace=True)
+        counts = np.bincount(idx, minlength=n).astype(np.float64)
+        out = group.iloc[idx].copy()
+        out[weight_col] = out[weight_col].values / counts[idx]
+        parts.append(out)
+    return pd.concat(parts, ignore_index=True)
+
+def smote_oversample(df, features, n_synth_per_group, k=5, group_col="signal_mass",
+                     weight_col="flat_weight", random_state=42):
+    """
+    SMOTE-style over-sampling (Chawla et al. 2002): synthetic events are convex combinations of two
+    real events of the SAME truth-mass hypothesis, found by k-nearest-neighbour search in the
+    standardized feature space. Never random noise, never a cross-mass mixture.
+
+    NOTE: this is *not* what ATLAS/CMS do - a full-text search of INSPIRE returns no ATLAS or CMS
+    record containing SMOTE. It is implemented as the comparison arm against bagging.
+    """
+    rng = np.random.RandomState(random_state)
+    kin = [f for f in features if f != group_col]
+    X = df[kin].values.astype(np.float64)
+    mu, sd = X.mean(axis=0), X.std(axis=0)
+    sd[sd == 0] = 1.0
+    Xz = (X - mu) / sd
+
+    synth = []
+    for key, group in df.groupby(group_col):
+        rows = np.asarray([df.index.get_loc(i) for i in group.index])
+        n = len(rows)
+        if n < 2:
+            continue
+        n_target = int(n_synth_per_group.get(key, 0))
+        if n_target <= 0:
+            continue
+        k_g = min(k, n - 1)
+        d = np.sqrt(((Xz[rows][:, None, :] - Xz[rows][None, :, :]) ** 2).sum(-1))
+        np.fill_diagonal(d, np.inf)
+        nn = np.argsort(d, axis=1)[:, :k_g]
+        for _ in range(n_target):
+            a = rng.randint(n)
+            b = nn[a, rng.randint(k_g)]
+            lam = rng.uniform(0.0, 1.0)
+            row = group.iloc[a].copy()
+            row[kin] = (lam * Xz[rows[a]] + (1.0 - lam) * Xz[rows[b]]) * sd + mu
+            row[group_col] = key
+            row[weight_col] = 0.5 * (group[weight_col].iloc[a] + group[weight_col].iloc[b])
+            synth.append(row)
+
+    if not synth:
+        return df
+    return pd.concat([df, pd.DataFrame(synth)], ignore_index=True)
+
+def df_train_val_split(df_sig, df_bkg, features, train_size=0.80, weight_col = "flat_weight",
+                       oversample="none", smote_k=5, smote_ratio=1.0, random_state=42):
     if not 0.0 < train_size < 1.0:
         raise ValueError("train_size must be between 0 and 1")
 
@@ -179,6 +270,21 @@ def df_train_val_split(df_sig, df_bkg, features, train_size=0.80, weight_col = "
 
     # Reweight all the signal samples to have a uniform truth mass distribution in the training.
     df_sig_train = reweight_to_uniform_distributions(df_sig_train)
+
+    # Over-sample the TRAINING signal only. The validation sample is never touched, so the
+    # overtraining check stays an honest train-vs-test comparison.
+    if oversample == "bagging":
+        df_sig_train = oversample_bagging(df_sig_train, group_col="signal_mass",
+                                          weight_col=weight_col, random_state=random_state)
+    elif oversample == "smote":
+        if "signal_mass" in df_sig_train.columns:
+            counts = df_sig_train.groupby("signal_mass").size()
+            target = {m: int(smote_ratio * n) for m, n in counts.items()}
+        else:
+            target = {}
+        df_sig_train = smote_oversample(df_sig_train, features, target, k=smote_k,
+                                        group_col="signal_mass", weight_col=weight_col,
+                                        random_state=random_state)
 
     # Convert
     X_all, y_all, w_all = to_Xyw(df_sig, df_bkg, features, weight_col)
@@ -272,12 +378,28 @@ def expected_significance_unbinned(model, X, y, w):
 
 class BoostedDecisionTrees:
 
-    def __init__(self, df_sig, df_bkg, features):
+    def __init__(self, df_sig, df_bkg, features, oversample="none", smote_k=5, smote_ratio=1.0,
+                 weight_treatment="none"):
 
         self.df_sig = df_sig
         self.df_bkg = df_bkg
         self.features = features
-        self.ds = df_train_val_split(df_sig, df_bkg, features)
+
+        # Over-sampling options (training half only; must be known before the split is built)
+        self.oversample = oversample
+        self.smote_k = smote_k
+        self.smote_ratio = smote_ratio
+
+        # Training-side background weight treatment: "none", "flatten" or "clip".
+        # self.df_bkg always keeps the physical weights used for evaluation.
+        self.weight_treatment = weight_treatment
+        df_bkg_train_source = df_bkg
+        if weight_treatment != "none":
+            df_bkg_train_source = self.treat_background_weights(df_bkg)
+
+        self.ds = df_train_val_split(df_sig, df_bkg_train_source, features,
+                                     oversample=oversample, smote_k=smote_k,
+                                     smote_ratio=smote_ratio)
         
         # Model options
         # see https://xgboost.readthedocs.io/en/latest/python/python_api.html#xgboost.XGBClassifier
@@ -340,6 +462,35 @@ class BoostedDecisionTrees:
 
     def get_model(self):
         return self.model
+
+    def treat_background_weights(self, df_bkg, weight_col="flat_weight", group_col="proc_name",
+                                 clip_quantile=0.999):
+        """
+        Optional training-side treatment of the background weight heterogeneity.
+
+        The background is a sum of processes whose per-event weights differ by ~3 orders of
+        magnitude. Two treatments are offered, both applied to the training copy only:
+
+          flatten : every process is normalised to the same total weight, equalising the statistical
+                    pull of each process - which is what a leaf floor expressed in effective events
+                    implicitly assumes.
+          clip    : weights are truncated at the `clip_quantile` quantile of the whole sample.
+                    In ATLAS/CMS weight clipping is a systematic-uncertainty technique, so this arm
+                    is a cross-check rather than a recommendation.
+
+        The physical weights are kept in self.df_bkg and used for every evaluation.
+        """
+        out = df_bkg.copy()
+        if self.weight_treatment == "flatten":
+            target = out.groupby(group_col)[weight_col].sum().mean()
+            for proc, group in out.groupby(group_col):
+                out.loc[group.index, weight_col] *= target / group[weight_col].sum()
+        elif self.weight_treatment == "clip":
+            hi = out[weight_col].quantile(clip_quantile)
+            out[weight_col] = out[weight_col].clip(upper=hi)
+        else:
+            raise ValueError(f"Unknown weight treatment: {self.weight_treatment}")
+        return out
 
     def update_params(self,**kwargs):
         self.params.update(kwargs)
@@ -408,22 +559,161 @@ class BoostedDecisionTrees:
         return w_tot
 
     def suggest_min_child_weight(self, w, y, min_events_in_leaf=100, debug = False):
-        # Suggested value: min_events_in_leaf * max_hessian_per_event
-        # max_hessian_per_event = 0.25 * w_i
-        mcw_suggested = min_events_in_leaf * 0.25 * np.mean(w[y == 0])
-        
-        # Calculate absolute maximum safe limit
-        # If min_child_weight > total hessian of the minority class, the minority class can NEVER split!
+        """
+        Leaf floor in *effective-event* currency.
+
+        min_child_weight is a threshold on the sum of hessians in a child. For the logistic loss the
+        hessian of an event is p(1-p)*w <= 0.25*w, so a floor of `min_events_in_leaf` effective
+        events corresponds to
+
+            mcw = 0.25 * min_events_in_leaf * w_eff ,
+
+        with w_eff = sum(w^2)/sum(w) the Kish effective weight of the class.
+
+        Why not the arithmetic mean (the previous implementation)? The background is a sum of six
+        processes whose weights are constant within a process but differ by up to ~1085x between
+        processes. The mean is then dominated by the heaviest process and describes no actual event:
+        it under-protects the light processes, because a leaf holding a handful of high-weight
+        events satisfies the floor while carrying almost no statistical information. The Kish weight
+        is the weight of an event in the equivalent equal-weight sample, so the floor is expressed in
+        the statistics that actually exist.
+
+        The result is capped so that the minority class can still split: its total hessian is
+        0.25*sum(w_minority), and a floor above that would forbid every split.
+        """
+        w = np.asarray(w, dtype=np.float64)
+        w_eff = max(effective_weight(w[y == c]) for c in (0, 1))
+        mcw_suggested = min_events_in_leaf * 0.25 * w_eff
+
+        # Absolute maximum safe limit: total hessian of the smaller class
         min_class_weight = min(np.sum(w[y == 1]), np.sum(w[y == 0]))
         mcw_max_safe_limit = 0.25 * min_class_weight
-        
-        if self.debug:
+        # keep the minority class able to populate at least ~8 leaves
+        mcw_suggested = min(mcw_suggested, mcw_max_safe_limit / 8.0)
+
+        if self.debug or debug:
             print(f"Diagnostics for the 'min_child_weight' paramater (using all samples):")
             print(f"  > Min/Max/Average event weight  : {np.min(w):.2e} / {np.max(w):.2e} / {np.mean(w):.2e}")
-            print(f"  > Suggested min_child_weight    : {mcw_suggested:.2e} (allows splits with >= {min_events_in_leaf} events)")
+            print(f"  > Kish effective weight         : {w_eff:.2e}  (N_eff = {effective_events(w):.1f} of {len(w)} rows)")
+            print(f"  > Suggested min_child_weight    : {mcw_suggested:.2e} (>= {min_events_in_leaf} effective events per leaf)")
             print(f"  > Absolute Maximum safe limit   : {mcw_max_safe_limit:.2e} (never exceed this, otherwise minority class can NEVER split!)")
         
         return mcw_suggested, mcw_max_safe_limit
+
+    def suggest_bagging_params(self, sep_topk=3, subsample_floor=0.5, colsample_floor=0.2, debug=False):
+        """
+        Bagging parameters derived from the sample itself (no HPO).
+
+        colsample_bytree : the kinematic features are strongly correlated (max |rho| ~ 0.94), so the
+            number of statistically independent directions is the *effective rank* of the feature
+            correlation matrix (participation ratio of its eigenvalues). A tree then sees a fraction
+            n_eff/n_features of the columns instead of an arbitrary number: extra columns mostly add
+            redundant directions, and redundancy is what promotes memorization.
+
+        subsample : the cleaner the univariate separation, the easier it is for the model to carve
+            out individual events, so the stronger the row sub-sampling:
+            subsample = clip(1 - (sep_auc - 0.5), floor, 1).
+        """
+        kin = [f for f in self.features if f != "signal_mass"]
+
+        X = pd.concat([self.df_sig[self.features], self.df_bkg[self.features]]).astype(float)
+        good = X.std()[(X.std() > 0)].index
+        C = np.corrcoef(X[good].values.T)
+        ev = np.clip(np.linalg.eigvalsh(C), 0, None)
+        n_eff = float(ev.sum() ** 2 / (ev ** 2).sum())
+        colsample = float(np.clip(n_eff / len(self.features), colsample_floor, 1.0))
+
+        # univariate separation on unique background events, with the physical weights
+        if "event_id" in self.df_bkg.columns:
+            ub = self.df_bkg.drop_duplicates(subset="event_id")
+        else:
+            ub = self.df_bkg
+        y = np.r_[np.ones(len(self.df_sig)), np.zeros(len(ub))]
+        wv = np.r_[self.df_sig["flat_weight"].values, ub["flat_weight"].values]
+        aucs = []
+        for f in kin:
+            a = roc_auc_score(y, np.r_[self.df_sig[f].values, ub[f].values], sample_weight=wv)
+            aucs.append(max(a, 1.0 - a))
+        sep = float(np.mean(sorted(aucs)[-sep_topk:]))
+        subsample = float(np.clip(1.0 - (sep - 0.5), subsample_floor, 1.0))
+
+        if debug or self.debug:
+            print("Diagnostics for the bagging parameters:")
+            print(f"  > effective rank of the features = {n_eff:.2f} / {len(self.features)}"
+                  f"  -> colsample_bytree = {colsample:.3f}")
+            print(f"  > mean top-{sep_topk} univariate AUC = {sep:.3f} -> subsample = {subsample:.3f}")
+
+        return {"colsample_bytree": colsample, "subsample": subsample,
+                "sep_auc": sep, "n_eff_features": n_eff}
+
+    def suggest_regularization(self, min_events_in_leaf=100, learning_rate=0.1, max_leaves=32,
+                               debug=False):
+        """
+        Derive the whole regularization set from the sample. One rule, identical for every channel.
+
+        All structural parameters are expressed in the same currency - effective events - through the
+        Kish effective weight, so the prescription is invariant under a rescaling of the weights.
+        That invariance is what the defaults lacked: min_child_weight=1 is an absolute hessian
+        threshold, and for O(1e-4) weights it vetoes every split.
+
+          min_child_weight : leaf statistical floor, see suggest_min_child_weight
+          reg_lambda       : the L2 penalty is an additive hessian, so it is quoted as the hessian of
+                             `min_events_in_leaf` effective events; it shrinks leaf weights as if
+                             each leaf were backed by that many extra events
+          max_depth        : backstop from the hessian budget,
+                             depth = ceil(log2(H_total / mcw)), the deepest balanced tree the sample
+                             can populate without violating the leaf floor
+          learning_rate    : fixed moderate value; the number of trees is set by early stopping
+          subsample / colsample_bytree : from feature separation and correlation, see
+                             suggest_bagging_params
+          gamma            : 0, it would duplicate min_child_weight in the same currency
+        """
+        y_train, w_train = self.ds["train"]["y"], self.ds["train"]["w"]
+        w_bal = self.balance_weights(y_train, w_train)
+
+        mcw, mcw_safe = self.suggest_min_child_weight(w_bal, y_train,
+                                                      min_events_in_leaf=min_events_in_leaf,
+                                                      debug=debug)
+        bag = self.suggest_bagging_params(debug=debug)
+
+        # L2: min_events_in_leaf effective events' worth of hessian
+        reg_lambda = 0.25 * min_events_in_leaf * effective_weight(w_bal[y_train == 0])
+
+        # depth backstop from the hessian budget, bounded by the number of leaves we accept
+        h_tot = 0.25 * w_bal.sum()
+        max_depth = int(np.clip(np.ceil(np.log2(max(h_tot / mcw, 2.0))), 3, 12))
+        max_depth = int(min(max_depth, np.ceil(np.log2(max_leaves)) + 1))
+
+        params = {
+            "min_child_weight" : float(mcw),
+            "max_depth"        : max_depth,
+            "reg_lambda"       : float(reg_lambda),
+            "gamma"            : 0.0,
+            "learning_rate"    : float(learning_rate),
+            "subsample"        : bag["subsample"],
+            "colsample_bytree" : bag["colsample_bytree"],
+        }
+        self.update_params(**params)
+
+        print("Derived regularization parameters (data-driven, no HPO):")
+        print(f"  > min_child_weight = {mcw:.4g}  (floor of {min_events_in_leaf} effective events;"
+              f" minority hessian budget {mcw_safe:.4g})")
+        print(f"  > max_depth        = {max_depth}  (hessian budget {h_tot:.4g} / mcw = {h_tot/mcw:.1f} leaves)")
+        print(f"  > reg_lambda       = {reg_lambda:.4g}, gamma = 0.0, learning_rate = {learning_rate}")
+        print(f"  > subsample        = {bag['subsample']:.3f}, colsample_bytree = {bag['colsample_bytree']:.3f}"
+              f"  (sep AUC {bag['sep_auc']:.3f}, effective rank {bag['n_eff_features']:.2f})")
+
+        if debug or self.debug:
+            rows = []
+            scale = w_bal[y_train == 0].sum() / self.ds["train"]["w"][y_train == 0].sum()
+            for proc, grp in self.df_bkg.groupby("proc_name"):
+                w_p = grp["flat_weight"].mean() * scale
+                rows.append((proc, mcw / (0.25 * w_p)))
+            print("  > Implied minimum rows per leaf, per background process:")
+            for proc, n_rows in rows:
+                print(f"      {proc:<10s}: {n_rows:,.0f} rows ({n_rows/21:.0f} unique events)")
+
+        return params
 
     def train(self):
 
@@ -1253,6 +1543,15 @@ class BoostedDecisionTrees:
         canvas.SaveAs(str(output_dir / "score_distributions.png"))
         canvas.SaveAs(str(output_dir / "score_distributions.pdf"))
         canvas.Close()
+
+        return {
+            "ks_p_sig_weighted": sig_w_ks, "ks_p_bkg_weighted": bkg_w_ks,
+            "ks_d_sig_weighted": sig_w_ks_d, "ks_d_bkg_weighted": bkg_w_ks_d,
+            "ks_p_sig_unweighted": sig_uw_ks, "ks_p_bkg_unweighted": bkg_uw_ks,
+            "ks_d_sig_unweighted": sig_uw_ks_d, "ks_d_bkg_unweighted": bkg_uw_ks_d,
+            "chi2_p_sig_weighted": chi2_p_sig_w, "chi2_p_bkg_weighted": chi2_p_bkg_w,
+            "chi2_p_sig_unweighted": chi2_p_sig_uw, "chi2_p_bkg_unweighted": chi2_p_bkg_uw,
+        }
 
     def draw_score_histogram(self, df_sig, df_bkg, plotter = None, nbins = 20, xMin = 0.0, xMax = 1.0, output_dir = "./", weight_col="flat_weight"):
         output_dir = Path(output_dir).resolve()
