@@ -404,8 +404,18 @@ class BoostedDecisionTrees:
         # Weights balancing options
         self.apply_weights_balancing = True
 
+        # Training-weight winsorization (see cap_weights): tames the ~3-orders-of-magnitude
+        # per-process weight spread; validation/test weights always stay physical.
+        self.apply_weight_capping = False
+        self.weight_cap_factor = 10.0
+        self.weight_cap_mode = "mean_factor"
+
         # hop
         self.hpo_study = None
+
+        # Strategy for the min_child_weight suggestion: "ess" (revised, Kish effective weight)
+        # or "mean" (original suggestion), see suggest_min_child_weight
+        self.mcw_strategy = "ess"
 
         # Other options
         self.debug = False
@@ -483,26 +493,59 @@ class BoostedDecisionTrees:
 
         return w_tot
 
-    def suggest_min_child_weight(self, w, y, min_events_in_leaf=100, debug = False):
+    def cap_weights(self, y, w, cap_factor=10.0, cap_mode="mean_factor"):
+        """
+        Winsorize extreme per-event weights so that all background processes live in a comparable
+        hessian currency. The background is a mixture of processes whose per-event weights span
+        ~3 orders of magnitude (e.g. VVV: a few events carrying most of the class weight); without
+        capping, no single min_child_weight can both protect the few heavy events from being
+        isolated into memorized leaves and keep fine granularity for the many light-weight events.
+        cap_mode="mean_factor": each event's weight is capped at cap_factor * (class mean weight).
+        cap_mode="percentile": capped at the cap_factor-th percentile of the class weights
+        (standard winsorization; no multiplicative constant to choose). In both cases each class
+        is renormalized to its original total, preserving class balancing. Only TRAINING weights
+        are capped; validation/test weights stay physical.
+        """
+        w = np.asarray(w, dtype=float).copy()
+        w_cap = np.zeros_like(w)
+        for c in (0, 1):
+            m = y == c
+            wc = w[m]
+            if cap_mode == "percentile":
+                cap = np.percentile(wc, cap_factor)
+            else:
+                cap = cap_factor * wc.mean()
+            wc_capped = np.minimum(wc, cap)
+            # renormalize the class to its original (balanced) total
+            wc_capped *= wc.sum() / wc_capped.sum()
+            w_cap[m] = wc_capped
+        return w_cap
+
+    def suggest_min_child_weight(self, w, y, min_events_in_leaf=100, strategy="ess", debug = False):
         """
         Revised for heterogeneous per-process weights. The per-event weights span ~3 orders of
         magnitude across the background processes, so a mean-weight-based threshold allowed leaves
         holding only a couple of heavy-weight (e.g. VVV) events -> memorization -> overtraining.
-        Instead the threshold is anchored on the Kish effective weight w_eff = sum(w^2)/sum(w):
+        strategy="mean": the original suggestion, min_events_in_leaf * 0.25 * mean(w[bkg]).
+        strategy="ess" (default): anchored on the Kish effective weight w_eff = sum(w^2)/sum(w):
         - with equal weights, w_eff == mean(w) (the old behaviour);
         - with heterogeneous weights, w_eff > mean(w) and a leaf at the threshold carries on
           average at least min_events_in_leaf *effective* (Kish) events of MC statistics.
-        The suggestion is capped at half the total hessian of the smaller class, so the minority
-        class can always still split.
+        The ESS suggestion is capped at half the total hessian of the smaller class, so the
+        minority class can always still split.
         """
         w = np.asarray(w, dtype=float)
-        w_eff = 0.0
-        for c in (0, 1):
-            wc = w[y == c]
-            if wc.sum() > 0:
-                w_eff = max(w_eff, (wc ** 2).sum() / wc.sum())
 
-        mcw_suggested = min_events_in_leaf * 0.25 * w_eff
+        if strategy == "mean":
+            # original behaviour, kept for the baseline comparison
+            mcw_suggested = min_events_in_leaf * 0.25 * np.mean(w[y == 0])
+        else:
+            w_eff = 0.0
+            for c in (0, 1):
+                wc = w[y == c]
+                if wc.sum() > 0:
+                    w_eff = max(w_eff, (wc ** 2).sum() / wc.sum())
+            mcw_suggested = min_events_in_leaf * 0.25 * w_eff
 
         # Absolute maximum safe limit: total hessian of the smaller class
         min_class_weight = min(np.sum(w[y == 1]), np.sum(w[y == 0]))
@@ -512,8 +555,9 @@ class BoostedDecisionTrees:
         if self.debug or debug:
             print(f"Diagnostics for the 'min_child_weight' paramater (using all samples):")
             print(f"  > Min/Max/Average event weight  : {np.min(w):.2e} / {np.max(w):.2e} / {np.mean(w):.2e}")
-            print(f"  > Effective weight (Kish)       : {w_eff:.2e} (sum(w^2)/sum(w), max over classes)")
-            print(f"  > Suggested min_child_weight    : {mcw_suggested:.2e} (>= {min_events_in_leaf} effective events per leaf, capped at 0.5 * safe limit)")
+            if strategy != "mean":
+                print(f"  > Effective weight (Kish)       : {w_eff:.2e} (sum(w^2)/sum(w), max over classes)")
+            print(f"  > Suggested min_child_weight    : {mcw_suggested:.2e} (strategy={strategy})")
             print(f"  > Absolute Maximum safe limit   : {mcw_max_safe_limit:.2e} (never exceed this, otherwise minority class can NEVER split!)")
 
         return mcw_suggested, mcw_max_safe_limit
@@ -573,8 +617,13 @@ class BoostedDecisionTrees:
         """
         y_train, w_train = self.ds["train"]["y"], self.ds["train"]["w"]
         w_bal = self.balance_weights(y_train, w_train)
+        if self.apply_weight_capping:
+            w_train_reg = self.cap_weights(y_train, w_bal, cap_factor=self.weight_cap_factor,
+                                           cap_mode=self.weight_cap_mode)
+        else:
+            w_train_reg = w_bal
 
-        mcw, mcw_safe = self.suggest_min_child_weight(w_bal, y_train, min_events_in_leaf=min_events_in_leaf, debug=debug)
+        mcw, mcw_safe = self.suggest_min_child_weight(w_train_reg, y_train, min_events_in_leaf=min_events_in_leaf, debug=debug)
         h_tot = 0.25 * w_bal.sum()
         max_depth = max(3, int(np.ceil(np.log2(max(h_tot / mcw, 2.0)))))
         bag = self.suggest_bagging_params(debug=debug)
@@ -624,9 +673,14 @@ class BoostedDecisionTrees:
         if self.apply_weights_balancing:
             w_train = self.balance_weights(y_train, w_train)
             w_val = self.balance_weights(y_val, w_val)
-        
+
+        # Winsorize the TRAINING weights only (see cap_weights); validation weights stay physical.
+        if self.apply_weight_capping:
+            w_train = self.cap_weights(y_train, w_train, cap_factor=self.weight_cap_factor,
+                                       cap_mode=self.weight_cap_mode)
+
         if self.use_min_child_weight_suggestion:
-            self.update_params(min_child_weight = self.suggest_min_child_weight(w_train, y_train)[0])
+            self.update_params(min_child_weight = self.suggest_min_child_weight(w_train, y_train, strategy=self.mcw_strategy)[0])
 
         self.print_features()
         self.print_params()

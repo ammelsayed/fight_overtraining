@@ -22,9 +22,9 @@ def load(ch, half):
     return sig, bkg, feats
 
 
-def auc_of(bdt, df_sig, df_bkg):
-    X, y, w = to_Xyw(df_sig, df_bkg, bdt.features)
-    return float(roc_auc_score(y, bdt.predict(X), sample_weight=w))
+def auc_of(bdt, df_sig, df_bkg, weighted=True):
+    X, y, w = to_Xyw(df_sig, df_bkg, bdt.features, weight_col="flat_weight")
+    return float(roc_auc_score(y, bdt.predict(X), sample_weight=w if weighted else None))
 
 
 def run(ch, train_half, mode, out_root, debug=False):
@@ -33,11 +33,26 @@ def run(ch, train_half, mode, out_root, debug=False):
     sig_te, bkg_te, _ = load(ch, test_half)
     features = feats + ["signal_mass"]
 
-    kwargs = dict(apply_oversampling=True) if mode in ("smote", "both") else {}
+    kwargs = dict(apply_oversampling=True) if mode in ("smote", "both", "both2", "both3") else {}
     bdt = BoostedDecisionTrees(sig_tr, bkg_tr, features, **kwargs)
-    if mode in ("reg", "both"):
+    # the server GPUs are shared and heavily contended -> run the whole matrix on CPU
+    bdt.update_params(device="cpu", nthread=min(16, os.cpu_count() or 1))
+    if mode in ("reg", "both", "reg2", "both2", "reg3", "both3"):
         bdt.debug = debug
+        if mode in ("reg2", "both2"):
+            # v2: winsorize extreme training weights at 10x the class mean before deriving/applying
+            bdt.apply_weight_capping = True
+        if mode in ("reg3", "both3"):
+            # v3: winsorize at the class 95th-percentile weight (no multiplicative constant)
+            bdt.apply_weight_capping = True
+            bdt.weight_cap_mode = "percentile"
+            bdt.weight_cap_factor = 95.0
         bdt.suggest_regularization(debug=debug)
+    elif mode in ("baseline_mcw", "smote"):
+        # the current method: XGBoost defaults + the ORIGINAL mean-based min_child_weight suggestion
+        # (smote isolates the oversampling effect on top of it)
+        bdt.mcw_strategy = "mean"
+        bdt.use_min_child_weight_suggestion = True
 
     t0 = time.time()
     bdt.train()
@@ -59,6 +74,8 @@ def run(ch, train_half, mode, out_root, debug=False):
         channel=ch, mode=mode, train_half=train_half,
         auc_slice_train=auc_of(bdt, s_tr, b_tr),
         auc_slice_test=auc_of(bdt, s_te, b_te),
+        auc_slice_train_uw=auc_of(bdt, s_tr, b_tr, weighted=False),
+        auc_slice_test_uw=auc_of(bdt, s_te, b_te, weighted=False),
         auc_all_train=auc_of(bdt, sig_tr, bkg_tr),
         auc_all_test=auc_of(bdt, sig_te, bkg_te),
         best_iteration=getattr(bdt.model, "best_iteration", None),
@@ -79,8 +96,9 @@ def run(ch, train_half, mode, out_root, debug=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--modes", nargs="+", default=["baseline", "reg", "smote", "both"],
-                    choices=["baseline", "reg", "smote", "both"])
+    ap.add_argument("--modes", nargs="+",
+                    default=["baseline", "baseline_mcw", "reg", "smote", "both", "reg2", "both2", "reg3", "both3"],
+                    choices=["baseline", "baseline_mcw", "reg", "smote", "both", "reg2", "both2", "reg3", "both3"])
     ap.add_argument("--channels", nargs="+", default=CHANNELS)
     ap.add_argument("--out", default="./results")
     ap.add_argument("--debug", action="store_true")
