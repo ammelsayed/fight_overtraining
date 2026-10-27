@@ -160,7 +160,14 @@ For every channel, every direction (DF1→DF2 and DF2→DF1) and every configura
    which reports the Kolmogorov–Smirnov probability and distance and the χ² probability between the
    train and test score distributions, separately for signal and background, weighted and unweighted;
 3. record the train/test AUC gap on the mass slice, the KS p-values and the **test AUC**. Killing
-   overtraining by destroying the classifier is not a result: the test AUC must survive.
+   overtraining by destroying the classifier is not a result: the test AUC must survive;
+4. **calibrate the test statistics against their own null** (`ks_control.py`, `ks_weighted.py`).
+   A KS *p*-value is only interpretable against the null appropriate to the sample at hand: pool the
+   train and test scores, resample the labels, and check whether the observed distance is actually
+   unusual. This matters here because the background weights span 1085× and `N_eff` is as low as 3,
+   which broadens the null of the weighted statistic far beyond what the nominal *p*-value assumes.
+   As an independent control, the *test* half is split in two and compared with itself: two samples
+   the classifier never saw.
 
 ## 5. References
 
@@ -281,6 +288,46 @@ The gap correlates with the available statistics rather than with the method:
 So the correct statement is not "method X overtrains" but "**4L_eeee has three effective background
 events**", and no regularization can manufacture statistics that are not in the sample.
 
+### 6.5.1 A null test of the KS statistic itself
+
+A KS *p*-value is only meaningful against the right null. Two controls were run on the recommended
+configuration (`reg_flatten`), because a small *p* can come from weight heterogeneity rather than
+from the classifier.
+
+**(a) Unweighted KS, bootstrapped null.** Pool the train and test scores, resample the labels 200
+times, and compare the observed distance to the resulting null distribution:
+
+| channel | D(train, test) | null median | null 95th pct | verdict |
+|---|---|---|---|---|
+| `3L_eee` | 0.0191 | 0.0191 | 0.0305 | inside the null |
+| `3L_eeeJ` | 0.0621 | 0.0447 | 0.0778 | inside the null |
+| `4L_eeee` | 0.0449 | 0.0876 | 0.1435 | inside the null |
+
+As a further control, the *test* half was split in two and compared with itself — two samples the
+model never saw. That control distance is the same size as the train-vs-test distance
+(`3L_eee`: 0.027 vs 0.019; `4L_eeee`: 0.063 vs 0.045). The classifier therefore adds **no
+train-specific structure** to the score distribution.
+
+**(b) Weighted KS, bootstrapped null.** The weighted statistic is what the overtraining plot actually
+quotes, and its null is much broader because the weights span 1085×:
+
+| channel / direction | weighted D | null median | null 95th pct | bootstrap *p* | verdict |
+|---|---|---|---|---|---|
+| `3L_eee` DF1 | 0.164 | 0.081 | 0.140 | 0.010 | **exceeds the null** |
+| `3L_eee` DF2 | 0.112 | 0.080 | 0.139 | 0.160 | inside |
+| `3L_eeeJ` DF1 | 0.352 | 0.292 | 0.518 | 0.327 | inside |
+| `3L_eeeJ` DF2 | 0.448 | 0.296 | 0.489 | 0.100 | inside |
+| `4L_eeee` DF1 | 0.851 | 0.553 | 0.849 | 0.037 | **exceeds the null** |
+| `4L_eeee` DF2 | 0.543 | 0.544 | 0.824 | 0.503 | inside |
+
+This is the one place where the result is not clean, and it must be stated rather than hidden: **in
+one of the two directions of two channels the weighted KS exceeds its null.** The excess is not
+reproduced when the direction is flipped, and the weighted statistic is dominated by the few
+highest-weight events (`N_eff` = 198 and 3.2), so a single event can move it. The honest reading is
+that the score distribution is consistent with the null in 4 of 6 directions, and that the remaining
+tension is confined to the weighted statistic of the low-`N_eff` samples rather than to a systematic
+train/test separation.
+
 ### 6.6 The recommended configuration
 
 `reg_flatten` / `flat_bagging` / `flat_smote` are within 0.001–0.002 of each other in test AUC.
@@ -305,8 +352,12 @@ Summary of the winning configuration across the three channels:
   "beats overtraining" claim can be tested against a working baseline. There, the derived
   regularization does **not** shrink the gap (0.013 → 0.016) but raises the test AUC (0.976 → 0.987);
   the baseline's small gap was luck, not virtue.
-- No channel shows a significant KS discrepancy in the derived configurations, which is the
-  operational definition of "no overtraining" used here.
+- The unweighted score distribution shows no train-specific structure in any channel (§6.5.1a), but
+  the **weighted** KS exceeds its null in one direction of two channels (§6.5.1b). The result is
+  therefore "no overtraining in the distribution the classifier learns", not "a clean bill of health
+  on every test statistic".
 - Everything above is a single random seed per configuration. The spread between the two directions
   (±0.05 in `4L_eeee`) is larger than most of the differences between methods, which is why the
   conclusions are stated as rankings rather than as precise numbers.
+- The null tests in §6.5.1 use 200–300 bootstrap resamples, so the quoted bootstrap *p*-values are
+  themselves uncertain at the ±0.02 level.
