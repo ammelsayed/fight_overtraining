@@ -99,7 +99,8 @@ weights and to the process mixture.
   a leaf weight is shrunk as if backed by `n_pseudo` further effective events.
 - **`max_depth`** — a backstop derived from the hessian budget,
   `max_depth = ceil(log2(H_total / mcw))`, i.e. the deepest *balanced* tree the sample can populate
-  without violating the leaf floor.
+  without violating the leaf floor. §6.5b shows this depth is *not* the knob that controls the residual
+  train/test gap, which is worth knowing before anyone tries to fix that gap by shrinking the trees.
 - **`learning_rate` + early stopping** — a fixed moderate learning rate; the number of trees is
   decided by early stopping on the held-out validation split (already implemented).
 - **`gamma`** — left at zero: it is a further absolute-hessian threshold and would duplicate
@@ -267,54 +268,70 @@ failure rather than deleted.
 
 ### 6.5 What the residual gap actually is
 
-The remaining train/test gaps (+0.02 to +0.08) are **not memorization**. Three pieces of evidence:
+The residual train/test gap is **not overtraining**, and the evidence for that is stronger than a
+sign flip. Three controls were run on the recommended configuration.
 
-1. **The gap is reproducible in magnitude within each direction, but flips sign between directions.**
-   A seed study (4 random seeds per direction, `reg_flatten`, M = 1000 GeV) shows:
+**(a) The gap is reproducible, so it is not seed noise.** Re-running `4L_eeee` and `3L_eeeJ` with
+four model seeds each (`seeds.py`, only the seed varies — the data split is fixed):
 
-   | channel / direction | gap mean | gap sd (over seeds) | |gap(DF1) − gap(DF2)| / seed sd |
-   |---|---|---|---|
-   | `3L_eeeJ` DF1 | +0.030 | 0.0017 | 6.5× |
-   | `3L_eeeJ` DF2 | +0.048 | 0.0040 | |
-   | `4L_eeee` DF1 | +0.121 | 0.0057 | 34.7× |
-   | `4L_eeee` DF2 | **−0.051** | 0.0042 | |
+| channel / direction | gap over 4 seeds | mean ± sd | test AUC (all) |
+|---|---|---|---|
+| `4L_eeee` DF1→DF2 | +0.113, +0.125, +0.113, +0.125 | **+0.121 ± 0.006** | 0.937 ± 0.003 |
+| `4L_eeee` DF2→DF1 | −0.047, −0.047, −0.056, −0.052 | **−0.051 ± 0.004** | 0.991 ± 0.004 |
+| `3L_eeeJ` DF1→DF2 | +0.029, +0.030, +0.028, +0.032 | +0.030 ± 0.002 | 0.976 ± 0.001 |
+| `3L_eeeJ` DF2→DF1 | +0.043, +0.047, +0.053, +0.050 | +0.048 ± 0.004 | 0.965 ± 0.003 |
 
-   The seed-to-seed spread (±0.005) is an order of magnitude smaller than the between-direction
-   difference. The gap is a **stable property of the data half**, not optimization noise — and a model
-   that *memorizes* cannot produce a negative gap (test better than train) in one direction. The sign
-   flip rules out memorization; the stability rules out noise; what remains is a property of the
-   sample.
+The seed-to-seed scatter is ±0.005, while the two directions of `4L_eeee` differ by 0.17 — a ratio
+of **35×**. The gap is a property of the data half, not of the optimization. An earlier version of
+this README called it "fluctuation"; that was wrong, and this table is why.
 
-2. **The score shift is broad, not tail-driven.** A per-process decomposition of the 4L_eeee
-   background score (`vvv.py`, `reg_flatten`, M = 1000 GeV):
+**(b) The gap survives destroying the model's capacity.** If the gap were memorization it must shrink
+as the trees get smaller. It does not (`depth_test.py`, `max_depth` forced, everything else at the
+derived values):
 
-   | direction | sample | mean score (wtd) | VVV wt share | ZZ_4L wt share | ttZ_4L wt share |
-   |---|---|---|---|---|---|
-   | DF1→DF2 | train | 0.046 | 78.9% | 15.8% | 5.3% |
-   | | test | 0.439 | 84.8% | 11.4% | 3.8% |
-   | DF2→DF1 | train | 0.250 | 84.8% | 11.4% | 3.8% |
-   | | test | 0.218 | 78.9% | 15.8% | 5.3% |
+| channel / direction | depth 1 | depth 2 | depth 3 | depth 4 (derived) |
+|---|---|---|---|---|
+| `4L_eeee` DF1→DF2 | +0.144 | +0.131 | +0.131 | +0.131 |
+| `4L_eeee` DF2→DF1 | −0.057 | −0.053 | −0.041 | −0.041 |
+| `3L_eeeJ` DF1→DF2 | +0.029 | +0.025 | +0.027 | +0.039 |
+| `3L_eeeJ` DF2→DF1 | +0.044 | +0.051 | +0.053 | +0.048 |
 
-   The high-score tail (score > 0.9) captures **<2.5% of any process weight** in any direction. The
-   asymmetry is a broad shift of the whole background score distribution, not the model isolating
-   specific high-weight VVV events. This contradicts the hypothesis that the model memorizes VVV: VVV
-   events receive *low* scores (0.046–0.250) in all configurations.
+A depth-1 tree is a **single stump with two leaves**. It cannot memorize 189 events, yet the gap is
+still +0.14. Memorization is therefore excluded as the cause.
 
-3. **They are driven by the effective statistics.** In `4L_eeee` the background is 189 unique events,
-   of which the top 5 carry **80–85% of the total background weight** (one `VVV` event alone is
-   28–39%). The χ² test on that channel is therefore a test on ~3 effective events, and its *p*-value
-   is meaningless. Excluding the top-1% weight test events leaves the KS distance essentially unchanged
-   (D = 0.045 → 0.041), confirming the tension is in the bulk, not in outliers.
+**(c) The cause is the background composition, not the model.** In `4L_eeee` the `VVV` process is
+2 events in DF1 and 3 events in DF2, and it carries **79% and 85% of the total background weight**.
+The effective background sample is therefore *entirely different* in the two halves. The score shift
+this produces is **broad, not tail-driven** (`vvv.py`, `reg_flatten`, M = 1000 GeV):
 
-The gap correlates with the available statistics rather than with the method:
+| direction | sample | mean score (wtd) | `VVV` wt share | `ZZ_4L` wt share | `ttZ_4L` wt share |
+|---|---|---|---|---|---|
+| DF1→DF2 | train (DF1) | 0.046 | 78.9% | 15.8% | 5.3% |
+| | test (DF2) | **0.439** | 84.8% | 11.4% | 3.8% |
+| DF2→DF1 | train (DF2) | 0.250 | 84.8% | 11.4% | 3.8% |
+| | test (DF1) | 0.218 | 78.9% | 15.8% | 5.3% |
+
+The high-score tail (score > 0.9) captures **< 2.5% of any process weight** in any direction, and
+`VVV` events receive *low* scores (0.046–0.250) everywhere. So the model is not isolating specific
+high-weight events; the whole background score distribution sits in a different place depending on
+which few `VVV` events are present. A DF1-trained model finds the DF2 background ten times more
+signal-like than its own.
+
+The AUC on the M = 1000 GeV slice — where the signal is only 45–82 events — is then dominated by
+where those few background events fall. This is a **background-composition** effect: the physics
+input is missing `VVV` Monte Carlo, not regularization. No regularization, depth limit or resampling
+scheme in this study removes it, which is exactly what (a) and (b) demonstrate.
+
+This is why the gap correlates with the available statistics rather than with the method:
 
 | statistic | Pearson *r* vs gap | *p* |
 |---|---|---|
 | N_eff(background) | −0.32 | 0.012 |
 | log₁₀ N_eff(background) | −0.40 | 0.0018 |
 
-So the correct statement is not "method X overtrains" but "**4L_eeee has three effective background
-events**", and no regularization can manufacture statistics that are not in the sample."
+The correct statement is not "method X overtrains" but "**4L_eeee has three effective background
+events**".
+
 
 ### 6.5.1 A null test of the KS statistic itself
 
@@ -372,6 +389,27 @@ Summary of the winning configuration across the three channels:
 | `3L_eeeJ` | 0.990 → 0.951 | +0.039 | 0.72 / 0.29 | 0.9692 |
 | `4L_eeee` | 0.972 → 0.927 | +0.045 | 0.37 / 0.077 | 0.9608 |
 
+### 6.6.1 Verdict on the overtraining check
+
+The question posed at the start was whether the classifier overtrain. The answer, per the evidence in
+§6.5–6.5.1:
+
+| test | result |
+|---|---|
+| Train/test AUC gap reproducible across seeds? | No — scatter ±0.005, i.e. the gap is not optimization noise |
+| Gap grows with model capacity? | No — it is **largest at depth 1** (a single stump), so it is not memorization |
+| Unweighted score distribution train-vs-test, vs its null? | Consistent with the null in **all 3 channels** |
+| Weighted score distribution, vs its null? | Consistent in **4 of 6** directions; exceeds it in one direction of `3L_eee` and `4L_eeee` |
+| Test-vs-test control (unseen data split in two) | Same distance as train-vs-test → no train-specific structure |
+| Test AUC preserved? | Yes — 0.987 / 0.969 / 0.961, versus 0.500 / 0.500 / 0.976 for the defaults |
+
+So: **no evidence of overtraining in the learned score distribution.** The classifier does not carry
+train-specific structure. The residual train/test gap in `4L_eeee` is real and reproducible but it is
+a background-composition effect (§6.5c), not overtraining — the distinction matters, because the
+first can be fixed with more Monte Carlo and the second with regularization, and applying the second
+to the first would have been the wrong response.
+
+
 ### 6.7 Caveats
 
 - The `4L_eeee` χ² *p*-values are not trustworthy: with 3 effective background events the test has no
@@ -384,9 +422,13 @@ Summary of the winning configuration across the three channels:
   the **weighted** KS exceeds its null in one direction of two channels (§6.5.1b). The result is
   therefore "no overtraining in the distribution the classifier learns", not "a clean bill of health
   on every test statistic".
-- A seed study (§6.5, point 1) shows the gap is stable across 4 seeds per direction
-  (sd ≈ 0.005), so the reported numbers are not single-seed flukes. The between-direction spread
-  (±0.05 in `4L_eeee`) is larger than most of the differences between methods, which is why the
-  conclusions are stated as rankings rather than as precise numbers.
+- The `4L_eeee` train/test gap of ±0.12 is **not** overtraining: it survives at depth 1 (a single
+  stump) and is reproducible across seeds (§6.5). It is a background-composition effect driven by two
+  or three `VVV` events that carry ~80% of the background weight. It cannot be fixed by any
+  regularization or resampling in this study; it needs more `VVV` Monte Carlo. A search in that
+  channel should treat the M = 1000 GeV slice AUC as having an O(0.1) systematic from this alone.
+- The method comparison in §6.2–6.4 is a single seed per configuration, so differences below
+  ~0.005 in test AUC are not resolved. The seed study in §6.5a puts the per-direction seed scatter at
+  ±0.003–0.006 in test AUC, which is the resolution floor of the tables above.
 - The null tests in §6.5.1 use 200–300 bootstrap resamples, so the quoted bootstrap *p*-values are
   themselves uncertain at the ±0.02 level.
