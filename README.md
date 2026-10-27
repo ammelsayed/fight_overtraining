@@ -59,6 +59,13 @@ a constant classifier. This is not overtraining — it is a classifier that neve
 node. Any method that is supposed to "beat overtraining" must first make the leaf floor
 **scale-invariant**, i.e. expressed in effective events rather than raw hessian.
 
+![why the defaults fail](figures/fig1_weights.png)
+
+*(a)* the six background processes span 1085× in per-event weight. *(b)* the row count overstates the
+available statistics by 20–60×; `4L_eeee` has **3** effective background events. *(c)* consequently the
+total hessian of the balanced training sample is 8.54 / 1.65 / **0.25** — below the default
+`min_child_weight = 1` in two of the three channels, so XGBoost rejects every split.
+
 ### 2.2 Background weights are not homogeneous
 
 The background is a sum of six processes whose weights are constant within a process but differ by
@@ -204,6 +211,13 @@ Two of the three channels produce a **constant classifier**. The reason is §2.1
 important finding of the study — the apparent "per-channel hyper-parameter problem" is one
 dimensional-analysis bug, not three different physics problems.
 
+![every method, three channels](figures/fig2_methods.png)
+
+Every mode on one plane: test AUC against the train/test gap, so "better" is up and left. The grey
+defaults collapse to (gap 0, AUC 0.5) in the two low-statistics channels; every derived
+configuration recovers them and lands in the same top-left cluster. The derived methods are
+indistinguishable from each other at this resolution — which is itself the result.
+
 ### 6.2 Data-driven regularization
 
 `reg` = the full derived set (§3.1, §3.2) with the physical weights kept.
@@ -225,6 +239,13 @@ parameters are:
 
 Note that `min_child_weight` is *three orders of magnitude* away from the XGBoost default, and that
 it tracks the available statistics rather than the channel identity.
+
+![derived parameters](figures/fig3_scale.png)
+
+*(a)* the derived `min_child_weight` and `reg_lambda` sit 10–100× below the XGBoost default of 1 — the
+defaults were never "mild regularization" in this weight currency, they were an absolute veto.
+*(b)* the bagging parameters are read off the sample: `colsample_bytree` ≈ the effective rank of the
+correlation matrix divided by the number of features, `subsample` from the top univariate separation.
 
 ### 6.3 Over-sampling
 
@@ -271,6 +292,13 @@ failure rather than deleted.
 The residual train/test gap is **not overtraining**, and the evidence for that is stronger than a
 sign flip. Three controls were run on the recommended configuration.
 
+![controls: seeds, depth, score shift](figures/fig4_seeds.png)
+
+*(a)* four seeds per direction — the gap barely moves, so it is not optimization noise, yet it flips
+sign between the two data halves. *(b)* forcing `max_depth = 1` (a single two-leaf stump) does **not**
+shrink the gap, so it is not model capacity. *(c)* the mechanism: a model trained on DF1 scores the
+held-out DF2 background ten times more signal-like than its own training background.
+
 **(a) The gap is reproducible, so it is not seed noise.** Re-running `4L_eeee` and `3L_eeeJ` with
 four model seeds each (`seeds.py`, only the seed varies — the data split is fixed):
 
@@ -316,6 +344,12 @@ The high-score tail (score > 0.9) captures **< 2.5% of any process weight** in a
 high-weight events; the whole background score distribution sits in a different place depending on
 which few `VVV` events are present. A DF1-trained model finds the DF2 background ten times more
 signal-like than its own.
+
+![background composition](figures/fig5_vvv.png)
+
+*(a)* in `4L_eeee` the `VVV` process is **2 events in DF1 and 3 in DF2** — the two halves are not
+statistically compatible background samples at all. *(b)* and those few events carry **79% and 85%**
+of the total background weight, so the effective background *is* `VVV`.
 
 The AUC on the M = 1000 GeV slice — where the signal is only 45–82 events — is then dominated by
 where those few background events fall. This is a **background-composition** effect: the physics
@@ -432,3 +466,17 @@ to the first would have been the wrong response.
   ±0.003–0.006 in test AUC, which is the resolution floor of the tables above.
 - The null tests in §6.5.1 use 200–300 bootstrap resamples, so the quoted bootstrap *p*-values are
   themselves uncertain at the ±0.02 level.
+
+## 7. Reproducing the figures
+
+Every figure is generated from the stored study output by one script:
+
+```bash
+source ~/root/bin/thisroot.sh          # bdt_methods imports ROOT
+/data/ammelsayed/venv/bin/python make_figures.py     # -> figures/*.png
+```
+
+`make_figures.py` reads `results_json/*.json` (the 66 study points), the seed and depth sweeps, and
+the parquet inputs; it recomputes the effective statistics from the data rather than hard-coding them.
+The study grid itself is `run_grid.sh` (parallel) or `study_one.py` (single point), and the controls
+are `analysis/seeds.py`, `analysis/depth_test.py`, `analysis/vvv.py`, `ks_control.py`, `ks_weighted.py`.
