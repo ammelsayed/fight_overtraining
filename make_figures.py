@@ -235,7 +235,7 @@ def fig_seeds():
     for xi, v in enumerate([0.046, 0.439]):
         ax[2].text(xi, v + 0.012, f"{v:.3f}", ha="center", fontsize=9, fontweight="bold")
     fig.tight_layout()
-    fig.savefig(f"{OUT}/fig4_seeds.png", bbox_inches="tight")
+    fig.savefig(f"{OUT}/fig5_seeds.png", bbox_inches="tight")
     plt.close(fig)
     print("fig4 done")
 
@@ -271,7 +271,7 @@ def fig_vvv():
         ax[1].text(xi - w / 2, a + 1.5, f"{a:.1f}", ha="center", fontsize=7.5)
         ax[1].text(xi + w / 2, b + 1.5, f"{b:.1f}", ha="center", fontsize=7.5)
     fig.tight_layout()
-    fig.savefig(f"{OUT}/fig5_vvv.png", bbox_inches="tight")
+    fig.savefig(f"{OUT}/fig6_vvv.png", bbox_inches="tight")
     plt.close(fig)
     print("fig5 done")
 
