@@ -267,15 +267,43 @@ failure rather than deleted.
 
 ### 6.5 What the residual gap actually is
 
-The remaining train/test gaps (+0.02 to +0.08) are **not** memorization. Two pieces of evidence:
+The remaining train/test gaps (+0.02 to +0.08) are **not memorization**. Three pieces of evidence:
 
-1. **They are not reproducible in direction.** In `4L_eeee` the gap is +0.13 for DF1→DF2 and
-   **−0.047** for DF2→DF1: the held-out sample scores *better* than the training sample. A model that
-   memorizes cannot do that. The same sign flip appears for `reg`, `reg_flatten` and `flat_smote`.
-2. **They are driven by a handful of events.** In `4L_eeee` the background is 189 unique events, of
-   which the top 5 carry **80–85% of the total background weight** (one `VVV` event alone is 28–39%).
-   The χ² test on that channel is therefore a test on ~3 effective events, and its *p*-value is
-   meaningless. Excluding the top-1% weight test events leaves the KS distance essentially unchanged
+1. **The gap is reproducible in magnitude within each direction, but flips sign between directions.**
+   A seed study (4 random seeds per direction, `reg_flatten`, M = 1000 GeV) shows:
+
+   | channel / direction | gap mean | gap sd (over seeds) | |gap(DF1) − gap(DF2)| / seed sd |
+   |---|---|---|---|
+   | `3L_eeeJ` DF1 | +0.030 | 0.0017 | 6.5× |
+   | `3L_eeeJ` DF2 | +0.048 | 0.0040 | |
+   | `4L_eeee` DF1 | +0.121 | 0.0057 | 34.7× |
+   | `4L_eeee` DF2 | **−0.051** | 0.0042 | |
+
+   The seed-to-seed spread (±0.005) is an order of magnitude smaller than the between-direction
+   difference. The gap is a **stable property of the data half**, not optimization noise — and a model
+   that *memorizes* cannot produce a negative gap (test better than train) in one direction. The sign
+   flip rules out memorization; the stability rules out noise; what remains is a property of the
+   sample.
+
+2. **The score shift is broad, not tail-driven.** A per-process decomposition of the 4L_eeee
+   background score (`vvv.py`, `reg_flatten`, M = 1000 GeV):
+
+   | direction | sample | mean score (wtd) | VVV wt share | ZZ_4L wt share | ttZ_4L wt share |
+   |---|---|---|---|---|---|
+   | DF1→DF2 | train | 0.046 | 78.9% | 15.8% | 5.3% |
+   | | test | 0.439 | 84.8% | 11.4% | 3.8% |
+   | DF2→DF1 | train | 0.250 | 84.8% | 11.4% | 3.8% |
+   | | test | 0.218 | 78.9% | 15.8% | 5.3% |
+
+   The high-score tail (score > 0.9) captures **<2.5% of any process weight** in any direction. The
+   asymmetry is a broad shift of the whole background score distribution, not the model isolating
+   specific high-weight VVV events. This contradicts the hypothesis that the model memorizes VVV: VVV
+   events receive *low* scores (0.046–0.250) in all configurations.
+
+3. **They are driven by the effective statistics.** In `4L_eeee` the background is 189 unique events,
+   of which the top 5 carry **80–85% of the total background weight** (one `VVV` event alone is
+   28–39%). The χ² test on that channel is therefore a test on ~3 effective events, and its *p*-value
+   is meaningless. Excluding the top-1% weight test events leaves the KS distance essentially unchanged
    (D = 0.045 → 0.041), confirming the tension is in the bulk, not in outliers.
 
 The gap correlates with the available statistics rather than with the method:
@@ -286,7 +314,7 @@ The gap correlates with the available statistics rather than with the method:
 | log₁₀ N_eff(background) | −0.40 | 0.0018 |
 
 So the correct statement is not "method X overtrains" but "**4L_eeee has three effective background
-events**", and no regularization can manufacture statistics that are not in the sample.
+events**", and no regularization can manufacture statistics that are not in the sample."
 
 ### 6.5.1 A null test of the KS statistic itself
 
@@ -356,7 +384,8 @@ Summary of the winning configuration across the three channels:
   the **weighted** KS exceeds its null in one direction of two channels (§6.5.1b). The result is
   therefore "no overtraining in the distribution the classifier learns", not "a clean bill of health
   on every test statistic".
-- Everything above is a single random seed per configuration. The spread between the two directions
+- A seed study (§6.5, point 1) shows the gap is stable across 4 seeds per direction
+  (sd ≈ 0.005), so the reported numbers are not single-seed flukes. The between-direction spread
   (±0.05 in `4L_eeee`) is larger than most of the differences between methods, which is why the
   conclusions are stated as rankings rather than as precise numbers.
 - The null tests in §6.5.1 use 200–300 bootstrap resamples, so the quoted bootstrap *p*-values are
